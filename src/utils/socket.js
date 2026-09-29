@@ -4,10 +4,9 @@ let socket = null;
 
 export function getSocket() {
   if (!socket) {
-    // In production or development with proxy
-    const socketUrl = window.location.hostname === 'localhost' 
-      ? 'http://localhost:4000' 
-      : window.location.origin;
+    const socketUrl = window.location.hostname === 'localhost'
+      ? 'http://localhost:4000'
+      : 'https://cinesync-server-2qk.onrender.com';
 
     socket = io(socketUrl, {
       transports: ['websocket', 'polling'],
