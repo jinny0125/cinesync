@@ -6,7 +6,7 @@ export function getSocket() {
   if (!socket) {
     const socketUrl = window.location.hostname === 'localhost'
       ? 'http://localhost:4000'
-      : 'https://cinesync-server-2qk.onrender.com';
+      : 'https://cinesync-server-2q7k.onrender.com';
 
     socket = io(socketUrl, {
       transports: ['websocket', 'polling'],
