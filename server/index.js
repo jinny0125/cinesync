@@ -4,6 +4,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { Server } from 'socket.io';
 import cors from 'cors';
+import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -23,23 +24,93 @@ const io = new Server(server, {
   }
 });
 
-// In-memory active room registry (strictly transient - zero persistence)
+/**
+ * Room Registry (In-Memory, Persistent across reconnects)
+ * Each room:
+ *   - Max 2 permanent slots (slot1, slot2)
+ *   - Each slot has: sessionToken, username, socketId (current), lastSeen
+ *   - Room stays alive for 30 minutes after last person leaves (reconnect window)
+ *   - Room deleted if empty for more than ROOM_TTL ms
+ */
+
 const rooms = new Map();
+
+// Room Time-To-Live: 30 minutes after last disconnect
+const ROOM_TTL = 30 * 60 * 1000;
+
+// Clean up rooms that have been empty too long
+function scheduleRoomCleanup(roomId) {
+  const roomState = rooms.get(roomId);
+  if (!roomState) return;
+
+  if (roomState.cleanupTimer) {
+    clearTimeout(roomState.cleanupTimer);
+  }
+
+  roomState.cleanupTimer = setTimeout(() => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    // Only delete if both slots are disconnected
+    const slot1Active = room.slot1?.socketId && io.sockets.sockets.has(room.slot1.socketId);
+    const slot2Active = room.slot2?.socketId && io.sockets.sockets.has(room.slot2.socketId);
+
+    if (!slot1Active && !slot2Active) {
+      console.log(`🗑️  Room ${roomId} expired after 30min idle. Cleaning up.`);
+      rooms.delete(roomId);
+    }
+  }, ROOM_TTL);
+}
+
+// Get active participants list for a room
+function getActiveParticipants(roomState) {
+  const list = [];
+  for (const slot of ['slot1', 'slot2']) {
+    const s = roomState[slot];
+    if (s && s.socketId && io.sockets.sockets.has(s.socketId)) {
+      list.push({
+        id: s.socketId,
+        username: s.username,
+        sessionToken: s.sessionToken,
+        slot
+      });
+    }
+  }
+  return list;
+}
+
+// Find slot by session token (for reconnect)
+function findSlotByToken(roomState, token) {
+  if (roomState.slot1?.sessionToken === token) return 'slot1';
+  if (roomState.slot2?.sessionToken === token) return 'slot2';
+  return null;
+}
+
+// Get next available slot
+function getAvailableSlot(roomState) {
+  if (!roomState.slot1) return 'slot1';
+  if (!roomState.slot2) return 'slot2';
+  return null; // Room is full
+}
 
 io.on('connection', (socket) => {
   let currentRoom = null;
   let currentUser = null;
+  let currentSlot = null;
+  let currentToken = null;
 
-  // 1. Room Joining & Lifecycle
-  socket.on('join-room', ({ roomId, username }) => {
+  // 1. Room Joining with Persistent Session Token
+  socket.on('join-room', ({ roomId, username, sessionToken }) => {
     currentRoom = roomId;
     currentUser = username || `Guest_${socket.id.substring(0, 4)}`;
 
     socket.join(roomId);
 
+    // Create room if it doesn't exist
     if (!rooms.has(roomId)) {
       rooms.set(roomId, {
-        participants: new Map(),
+        slot1: null,
+        slot2: null,
         currentMedia: {
           type: 'sample',
           url: '/sample-cinema.mp4',
@@ -47,35 +118,91 @@ io.on('connection', (socket) => {
           currentTime: 0,
           isPlaying: false,
           playbackRate: 1
-        }
+        },
+        cleanupTimer: null,
+        createdAt: Date.now()
       });
     }
 
     const roomState = rooms.get(roomId);
-    roomState.participants.set(socket.id, {
-      id: socket.id,
-      username: currentUser,
-      joinedAt: Date.now()
-    });
 
-    const participantsList = Array.from(roomState.participants.values());
+    // Cancel any pending cleanup timer since someone is joining
+    if (roomState.cleanupTimer) {
+      clearTimeout(roomState.cleanupTimer);
+      roomState.cleanupTimer = null;
+    }
 
-    // Send current room state & peer list to the joining socket
+    // Check if this is a RECONNECT (existing session token matching a slot)
+    let assignedSlot = null;
+    let assignedToken = sessionToken;
+    let isReconnect = false;
+
+    if (sessionToken) {
+      const existingSlot = findSlotByToken(roomState, sessionToken);
+      if (existingSlot) {
+        // Valid reconnect — reclaim the slot
+        assignedSlot = existingSlot;
+        isReconnect = true;
+        roomState[existingSlot].socketId = socket.id;
+        roomState[existingSlot].username = currentUser;
+        roomState[existingSlot].lastSeen = Date.now();
+        console.log(`🔄 Reconnect: ${currentUser} reclaimed ${existingSlot} in room ${roomId}`);
+      }
+    }
+
+    // New join (no token or token not found in this room)
+    if (!assignedSlot) {
+      const freeSlot = getAvailableSlot(roomState);
+
+      if (!freeSlot) {
+        // Room is FULL — reject with error
+        socket.emit('room-full', {
+          message: 'This room is currently full (max 2 partners). Please create a different room or wait for someone to leave.'
+        });
+        socket.leave(roomId);
+        currentRoom = null;
+        return;
+      }
+
+      // Assign new slot
+      assignedToken = crypto.randomBytes(24).toString('hex');
+      assignedSlot = freeSlot;
+      roomState[freeSlot] = {
+        socketId: socket.id,
+        username: currentUser,
+        sessionToken: assignedToken,
+        joinedAt: Date.now(),
+        lastSeen: Date.now()
+      };
+
+      console.log(`✅ New join: ${currentUser} assigned ${assignedSlot} in room ${roomId}`);
+    }
+
+    currentSlot = assignedSlot;
+    currentToken = assignedToken;
+
+    const participants = getActiveParticipants(roomState);
+
+    // Send room state back to the joining socket (including their own session token for storage)
     socket.emit('room-state', {
       media: roomState.currentMedia,
-      participants: participantsList,
-      yourId: socket.id
+      participants,
+      yourId: socket.id,
+      sessionToken: assignedToken, // IMPORTANT: frontend stores this
+      slot: assignedSlot,
+      isReconnect
     });
 
-    // Notify other peers in room
+    // Notify partner that someone joined/reconnected
     socket.to(roomId).emit('partner-joined', {
       id: socket.id,
       username: currentUser,
-      participants: participantsList
+      participants,
+      isReconnect
     });
   });
 
-  // 2. Real-Time Media Synchronization Protocol
+  // 2. Real-Time Media Synchronization Protocol (unchanged)
   socket.on('media-change', (data) => {
     if (!currentRoom || !rooms.has(currentRoom)) return;
     const roomState = rooms.get(currentRoom);
@@ -87,7 +214,6 @@ io.on('connection', (socket) => {
       isPlaying: false,
       playbackRate: 1
     };
-
     socket.to(currentRoom).emit('remote-media-change', roomState.currentMedia);
   });
 
@@ -101,8 +227,6 @@ io.on('connection', (socket) => {
         roomState.currentMedia.playbackRate = data.playbackRate;
       }
     }
-
-    // Replicate instantly on partner's screen
     socket.to(currentRoom).emit('remote-media-action', {
       action: data.action,
       currentTime: data.currentTime,
@@ -113,7 +237,6 @@ io.on('connection', (socket) => {
   });
 
   socket.on('media-heartbeat-sync', (data) => {
-    // Soft drift check broadcast
     if (!currentRoom) return;
     socket.to(currentRoom).emit('partner-sync-heartbeat', {
       currentTime: data.currentTime,
@@ -123,7 +246,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  // 3. The Anti-Gravity Engagement Layer (Physics Floating Emojis)
+  // 3. Anti-Gravity Reactions
   socket.on('anti-gravity-reaction', (reaction) => {
     if (!currentRoom) return;
     socket.to(currentRoom).emit('remote-reaction', {
@@ -136,8 +259,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  // 4. Dual-Layer Privacy: Client-Side E2EE Communication
-  // The server only routes ciphertext. Zero-Knowledge privacy model.
+  // 4. E2EE Chat
   socket.on('e2ee-message', (encryptedPayload) => {
     if (!currentRoom) return;
     socket.to(currentRoom).emit('e2ee-message', {
@@ -150,7 +272,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  // 5. Dual-Layer Privacy: WebRTC P2P Direct AV Signaling
+  // 5. WebRTC P2P Signaling
   socket.on('p2p-signal-offer', (data) => {
     if (!currentRoom) return;
     socket.to(data.targetId || currentRoom).emit('p2p-signal-offer', {
@@ -175,7 +297,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Partner typing indicator
+  // Typing indicator
   socket.on('user-typing', ({ isTyping }) => {
     if (!currentRoom) return;
     socket.to(currentRoom).emit('partner-typing', {
@@ -185,23 +307,50 @@ io.on('connection', (socket) => {
     });
   });
 
-  // Clean-up on disconnect
+  // Disconnect — do NOT delete slot immediately, allow reconnect window
   socket.on('disconnect', () => {
     if (currentRoom && rooms.has(currentRoom)) {
       const roomState = rooms.get(currentRoom);
-      roomState.participants.delete(socket.id);
 
-      const remaining = Array.from(roomState.participants.values());
+      // Update slot with lastSeen but keep the slot alive for reconnect
+      if (currentSlot && roomState[currentSlot]?.socketId === socket.id) {
+        roomState[currentSlot].socketId = null; // Mark as disconnected but preserve token
+        roomState[currentSlot].lastSeen = Date.now();
+        console.log(`👋 ${currentUser} disconnected from slot ${currentSlot} in room ${currentRoom}. Slot reserved for 30min.`);
+      }
+
+      const remaining = getActiveParticipants(roomState);
       socket.to(currentRoom).emit('partner-left', {
         id: socket.id,
         username: currentUser,
-        participants: remaining
+        participants: remaining,
+        canRejoin: true // Tell partner this was a disconnect, not a deliberate leave
       });
 
-      if (roomState.participants.size === 0) {
-        rooms.delete(currentRoom);
+      // Schedule room cleanup if everyone is gone
+      if (remaining.length === 0) {
+        scheduleRoomCleanup(currentRoom);
       }
     }
+  });
+});
+
+// REST API: Room status check
+app.get('/api/room/:roomId', (req, res) => {
+  const roomState = rooms.get(req.params.roomId);
+  if (!roomState) {
+    return res.json({ exists: false, canJoin: true });
+  }
+
+  const activeCount = getActiveParticipants(roomState).length;
+  const totalSlots = (roomState.slot1 ? 1 : 0) + (roomState.slot2 ? 1 : 0);
+
+  res.json({
+    exists: true,
+    canJoin: totalSlots < 2,
+    activeParticipants: activeCount,
+    totalSlots,
+    isFull: totalSlots >= 2
   });
 });
 
@@ -214,7 +363,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Fallback SPA routing for Express 5
+// SPA fallback
 app.use((req, res) => {
   res.sendFile(path.join(distPath, 'index.html'));
 });
